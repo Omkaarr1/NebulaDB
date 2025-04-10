@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"container/list"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -21,9 +22,11 @@ import (
 )
 
 const (
-	basePath  = "./data"
-	walPath   = "./wal.log"
-	cacheSize = 100
+	basePath     = "./data"
+	walPath      = "./wal.log"
+	cacheSize    = 100
+	metaFileName = "files_meta.json"
+	replicaCount = 3
 )
 
 var (
@@ -110,6 +113,30 @@ var (
 	walMu sync.Mutex
 )
 
+type Metadata struct {
+	Key         string    `json:"key"`
+	Version     string    `json:"version"`
+	Size        int       `json:"size"`
+	CreatedAt   time.Time `json:"created_at"`
+	ContentType string    `json:"content_type"`
+}
+
+func writeMetadata(ns string, meta Metadata) {
+	metaPath := filepath.Join(basePath, ns, metaFileName)
+	var metas []Metadata
+
+	// Load existing
+	if data, err := os.ReadFile(metaPath); err == nil {
+		_ = json.Unmarshal(data, &metas)
+	}
+
+	// Append new
+	metas = append(metas, meta)
+
+	data, _ := json.MarshalIndent(metas, "", "  ")
+	_ = os.WriteFile(metaPath, data, 0644)
+}
+
 func writeWAL(op, namespace, key string, data []byte) {
 	walMu.Lock()
 	defer walMu.Unlock()
@@ -172,6 +199,14 @@ func listVersions(namespace, key string) ([]string, error) {
 	return versions, nil
 }
 
+func latestFilePath(namespace, key string) (string, error) {
+	versions, err := listVersions(namespace, key)
+	if err != nil || len(versions) == 0 {
+		return "", os.ErrNotExist
+	}
+	return filepath.Join(basePath, namespace, versions[len(versions)-1]), nil
+}
+
 func specificVersionPath(namespace, version string) (string, error) {
 	path := filepath.Join(basePath, namespace, version)
 	if _, err := os.Stat(path); err != nil {
@@ -180,12 +215,24 @@ func specificVersionPath(namespace, version string) (string, error) {
 	return path, nil
 }
 
-func latestFilePath(namespace, key string) (string, error) {
-	versions, err := listVersions(namespace, key)
-	if err != nil || len(versions) == 0 {
-		return "", os.ErrNotExist
+func writeToReplicas(paths []string, data []byte) error {
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(paths))
+	for _, path := range paths {
+		wg.Add(1)
+		go func(p string) {
+			defer wg.Done()
+			if err := os.WriteFile(p, data, 0644); err != nil {
+				errChan <- err
+			}
+		}(path)
 	}
-	return filepath.Join(basePath, namespace, versions[len(versions)-1]), nil
+	wg.Wait()
+	close(errChan)
+	if len(errChan) > 0 {
+		return <-errChan
+	}
+	return nil
 }
 
 func main() {
@@ -198,6 +245,7 @@ func main() {
 		ns := c.Params("namespace")
 		key := c.Params("key")
 		data := c.Body()
+		contentType := c.Get("Content-Type", "application/octet-stream")
 
 		compressed, err := gzipCompress(data)
 		if err != nil {
@@ -209,13 +257,28 @@ func main() {
 			return c.Status(500).SendString("Failed to build path")
 		}
 
-		writeWAL("WRITE", ns, key, compressed)
-
-		err = os.WriteFile(filePath, compressed, 0644)
-		if err != nil {
-			return c.Status(500).SendString("Write failed")
+		// Replication paths
+		paths := []string{filePath}
+		for i := 1; i < replicaCount; i++ {
+			replicaPath := fmt.Sprintf("%s.replica%d", filePath, i)
+			paths = append(paths, replicaPath)
 		}
+
+		writeWAL("WRITE", ns, key, compressed)
+		err = writeToReplicas(paths, compressed)
+		if err != nil {
+			return c.Status(500).SendString("Replica write failed")
+		}
+
 		cache.Put(ns+"/"+key, compressed)
+		writeMetadata(ns, Metadata{
+			Key:         key,
+			Version:     versionedName,
+			Size:        len(data),
+			CreatedAt:   time.Now(),
+			ContentType: contentType,
+		})
+
 		return c.JSON(fiber.Map{"status": "ok", "version": versionedName})
 	})
 
@@ -244,9 +307,6 @@ func main() {
 	})
 
 	app.Get("/versions/:namespace/:key", func(c *fiber.Ctx) error {
-		start := time.Now()
-		defer requestDuration.WithLabelValues("GET /versions/:namespace/:key").Observe(time.Since(start).Seconds())
-
 		ns := c.Params("namespace")
 		key := c.Params("key")
 		versions, err := listVersions(ns, key)
@@ -257,9 +317,6 @@ func main() {
 	})
 
 	app.Get("/version/:namespace/:version", func(c *fiber.Ctx) error {
-		start := time.Now()
-		defer requestDuration.WithLabelValues("GET /version/:namespace/:version").Observe(time.Since(start).Seconds())
-
 		ns := c.Params("namespace")
 		version := c.Params("version")
 		filePath, err := specificVersionPath(ns, version)
@@ -275,6 +332,56 @@ func main() {
 			return c.Status(500).SendString("Decompression failed")
 		}
 		return c.Send(data)
+	})
+
+	app.Get("/metadata/:namespace/:key", func(c *fiber.Ctx) error {
+		ns := c.Params("namespace")
+		key := c.Params("key")
+		metaPath := filepath.Join(basePath, ns, metaFileName)
+		data, err := os.ReadFile(metaPath)
+		if err != nil {
+			return c.Status(500).SendString("Metadata not found")
+		}
+		var metas []Metadata
+		_ = json.Unmarshal(data, &metas)
+		var filtered []Metadata
+		for _, m := range metas {
+			if m.Key == key {
+				filtered = append(filtered, m)
+			}
+		}
+		return c.JSON(filtered)
+	})
+
+	app.Get("/namespaces", func(c *fiber.Ctx) error {
+		entries, err := os.ReadDir(basePath)
+		if err != nil {
+			return c.Status(500).SendString("Failed to list namespaces")
+		}
+		var namespaces []string
+		for _, e := range entries {
+			if e.IsDir() {
+				namespaces = append(namespaces, e.Name())
+			}
+		}
+		return c.JSON(namespaces)
+	})
+
+	app.Get("/namespace/:name/files", func(c *fiber.Ctx) error {
+		ns := c.Params("name")
+		dir := filepath.Join(basePath, ns)
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			return c.Status(500).SendString("Namespace not found")
+		}
+		var keys []string
+		for _, f := range files {
+			if strings.HasSuffix(f.Name(), ".gz") {
+				key := strings.Split(f.Name(), "_")[0]
+				keys = append(keys, key)
+			}
+		}
+		return c.JSON(keys)
 	})
 
 	port := 3000
