@@ -193,7 +193,7 @@ MIT — free to use, modify, and deploy.
 
 ---
 
-**Built with caffeine and sarcasm by [@OMKAR](https://github.com/Omkaarrr1)** ☕
+**Built with caffeine and sarcasm by [@OMKAR](https://github.com/Omkaarr1)** ☕
 ```
 
 ---
