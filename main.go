@@ -15,13 +15,43 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"net/http"
 )
 
 const (
-	basePath = "./data"
-	walPath  = "./wal.log"
+	basePath  = "./data"
+	walPath   = "./wal.log"
 	cacheSize = 100
 )
+
+var (
+	opCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "nebula_operations_total",
+			Help: "Total number of operations by type",
+		},
+		[]string{"operation"},
+	)
+	requestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "nebula_request_duration_seconds",
+			Help:    "Histogram of request durations",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"endpoint"},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(opCounter)
+	prometheus.MustRegister(requestDuration)
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		http.ListenAndServe(":2112", nil)
+	}()
+}
 
 type CacheItem struct {
 	key   string
@@ -88,6 +118,7 @@ func writeWAL(op, namespace, key string, data []byte) {
 	entry := fmt.Sprintf("%s|%s|%s|%d\n", op, namespace, key, len(data))
 	f.WriteString(entry)
 	f.Write(data)
+	opCounter.WithLabelValues(op).Inc()
 }
 
 func gzipCompress(data []byte) ([]byte, error) {
@@ -161,6 +192,9 @@ func main() {
 	app := fiber.New()
 
 	app.Post("/:namespace/:key", func(c *fiber.Ctx) error {
+		start := time.Now()
+		defer requestDuration.WithLabelValues("POST /:namespace/:key").Observe(time.Since(start).Seconds())
+
 		ns := c.Params("namespace")
 		key := c.Params("key")
 		data := c.Body()
@@ -186,6 +220,9 @@ func main() {
 	})
 
 	app.Get("/:namespace/:key", func(c *fiber.Ctx) error {
+		start := time.Now()
+		defer requestDuration.WithLabelValues("GET /:namespace/:key").Observe(time.Since(start).Seconds())
+
 		ns := c.Params("namespace")
 		key := c.Params("key")
 		cacheKey := ns + "/" + key
@@ -207,6 +244,9 @@ func main() {
 	})
 
 	app.Get("/versions/:namespace/:key", func(c *fiber.Ctx) error {
+		start := time.Now()
+		defer requestDuration.WithLabelValues("GET /versions/:namespace/:key").Observe(time.Since(start).Seconds())
+
 		ns := c.Params("namespace")
 		key := c.Params("key")
 		versions, err := listVersions(ns, key)
@@ -217,6 +257,9 @@ func main() {
 	})
 
 	app.Get("/version/:namespace/:version", func(c *fiber.Ctx) error {
+		start := time.Now()
+		defer requestDuration.WithLabelValues("GET /version/:namespace/:version").Observe(time.Since(start).Seconds())
+
 		ns := c.Params("namespace")
 		version := c.Params("version")
 		filePath, err := specificVersionPath(ns, version)
@@ -235,6 +278,6 @@ func main() {
 	})
 
 	port := 3000
-	fmt.Printf("\u2708 Running on http://localhost:%d\n", port)
+	fmt.Printf("✈ Running on http://localhost:%d\n", port)
 	app.Listen(":" + strconv.Itoa(port))
 }
