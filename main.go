@@ -1,390 +1,344 @@
 package main
 
 import (
-	"bytes"
-	"compress/gzip"
-	"container/list"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
+	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/compress"
+	"mime"
+	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
-	"strings"
-	"sync"
 	"time"
-
-	"github.com/gofiber/fiber/v2"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"net/http"
 )
 
 const (
 	basePath     = "./data"
-	walPath      = "./wal.log"
-	cacheSize    = 100
-	metaFileName = "files_meta.json"
-	replicaCount = 3
+	metaFileName = "metadata.json"
 )
 
-var (
-	opCounter = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "nebula_operations_total",
-			Help: "Total number of operations by type",
-		},
-		[]string{"operation"},
-	)
-	requestDuration = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "nebula_request_duration_seconds",
-			Help:    "Histogram of request durations",
-			Buckets: prometheus.DefBuckets,
-		},
-		[]string{"endpoint"},
-	)
-)
-
-func init() {
-	prometheus.MustRegister(opCounter)
-	prometheus.MustRegister(requestDuration)
-	go func() {
-		http.Handle("/metrics", promhttp.Handler())
-		http.ListenAndServe(":2112", nil)
-	}()
+type VersionMetadata struct {
+	Version      string    `json:"version"`
+	Size         int       `json:"size"`
+	CreatedAt    time.Time `json:"created_at"`
+	ContentType  string    `json:"content_type"`
+	PasswordHash string    `json:"password_hash,omitempty"`
 }
-
-type CacheItem struct {
-	key   string
-	value []byte
-}
-
-type LRUCache struct {
-	capacity int
-	list     *list.List
-	items    map[string]*list.Element
-	lock     sync.RWMutex
-}
-
-func NewLRUCache(cap int) *LRUCache {
-	return &LRUCache{
-		capacity: cap,
-		list:     list.New(),
-		items:    make(map[string]*list.Element),
-	}
-}
-
-func (c *LRUCache) Get(key string) ([]byte, bool) {
-	c.lock.RLock()
-	elem, found := c.items[key]
-	c.lock.RUnlock()
-	if !found {
-		return nil, false
-	}
-	c.lock.Lock()
-	c.list.MoveToFront(elem)
-	c.lock.Unlock()
-	return elem.Value.(*CacheItem).value, true
-}
-
-func (c *LRUCache) Put(key string, value []byte) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	if elem, ok := c.items[key]; ok {
-		elem.Value.(*CacheItem).value = value
-		c.list.MoveToFront(elem)
-		return
-	}
-	if c.list.Len() >= c.capacity {
-		tail := c.list.Back()
-		if tail != nil {
-			c.list.Remove(tail)
-			delete(c.items, tail.Value.(*CacheItem).key)
-		}
-	}
-	elem := c.list.PushFront(&CacheItem{key, value})
-	c.items[key] = elem
-}
-
-var (
-	cache = NewLRUCache(cacheSize)
-	walMu sync.Mutex
-)
 
 type Metadata struct {
-	Key         string    `json:"key"`
-	Version     string    `json:"version"`
-	Size        int       `json:"size"`
-	CreatedAt   time.Time `json:"created_at"`
-	ContentType string    `json:"content_type"`
+	Key      string                      `json:"key"`
+	Versions map[string]VersionMetadata `json:"versions"`
 }
 
-func writeMetadata(ns string, meta Metadata) {
+func hashPassword(pw string) string {
+	h := sha256.Sum256([]byte(pw))
+	return hex.EncodeToString(h[:])
+}
+
+func getExtensionFromContentType(contentType string) string {
+	exts, _ := mime.ExtensionsByType(contentType)
+	if len(exts) > 0 {
+		return exts[0]
+	}
+	return ""
+}
+
+func writeMetadata(ns, key string, versionMeta VersionMetadata) {
 	metaPath := filepath.Join(basePath, ns, metaFileName)
 	var metas []Metadata
+	_ = os.MkdirAll(filepath.Join(basePath, ns), os.ModePerm)
 
-	// Load existing
 	if data, err := os.ReadFile(metaPath); err == nil {
 		_ = json.Unmarshal(data, &metas)
 	}
 
-	// Append new
-	metas = append(metas, meta)
+	found := false
+	for i := range metas {
+		if metas[i].Key == key {
+			metas[i].Versions[versionMeta.Version] = versionMeta
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		metas = append(metas, Metadata{
+			Key:      key,
+			Versions: map[string]VersionMetadata{versionMeta.Version: versionMeta},
+		})
+	}
 
 	data, _ := json.MarshalIndent(metas, "", "  ")
 	_ = os.WriteFile(metaPath, data, 0644)
 }
 
-func writeWAL(op, namespace, key string, data []byte) {
-	walMu.Lock()
-	defer walMu.Unlock()
-	f, _ := os.OpenFile(walPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	defer f.Close()
-	entry := fmt.Sprintf("%s|%s|%s|%d\n", op, namespace, key, len(data))
-	f.WriteString(entry)
-	f.Write(data)
-	opCounter.WithLabelValues(op).Inc()
-}
-
-func gzipCompress(data []byte) ([]byte, error) {
-	var buf bytes.Buffer
-	zw := gzip.NewWriter(&buf)
-	_, err := zw.Write(data)
+func getLatestVersion(ns, key string) (*VersionMetadata, error) {
+	metaPath := filepath.Join(basePath, ns, metaFileName)
+	data, err := os.ReadFile(metaPath)
 	if err != nil {
 		return nil, err
 	}
-	zw.Close()
-	return buf.Bytes(), nil
-}
-
-func gzipDecompress(data []byte) ([]byte, error) {
-	r, err := gzip.NewReader(bytes.NewReader(data))
-	if err != nil {
+	var metas []Metadata
+	if err := json.Unmarshal(data, &metas); err != nil {
 		return nil, err
 	}
-	defer r.Close()
-	return io.ReadAll(r)
-}
-
-func ensureDir(path string) error {
-	return os.MkdirAll(path, os.ModePerm)
-}
-
-func versionedFilePath(namespace, key string) (string, string, error) {
-	timestamp := time.Now().Format("20060102_150405")
-	versionedName := fmt.Sprintf("%s_%s.gz", key, timestamp)
-	nsPath := filepath.Join(basePath, namespace)
-	if err := ensureDir(nsPath); err != nil {
-		return "", "", err
-	}
-	filePath := filepath.Join(nsPath, versionedName)
-	return filePath, versionedName, nil
-}
-
-func listVersions(namespace, key string) ([]string, error) {
-	nsPath := filepath.Join(basePath, namespace)
-	files, err := os.ReadDir(nsPath)
-	if err != nil {
-		return nil, err
-	}
-	var versions []string
-	for _, f := range files {
-		if strings.HasPrefix(f.Name(), key+"_") && strings.HasSuffix(f.Name(), ".gz") {
-			versions = append(versions, f.Name())
+	for _, m := range metas {
+		if m.Key == key {
+			var latest VersionMetadata
+			var latestTime int64
+			for _, v := range m.Versions {
+				if t := v.CreatedAt.UnixNano(); t > latestTime {
+					latestTime = t
+					latest = v
+				}
+			}
+			return &latest, nil
 		}
 	}
-	sort.Strings(versions)
-	return versions, nil
+	return nil, os.ErrNotExist
 }
 
-func latestFilePath(namespace, key string) (string, error) {
-	versions, err := listVersions(namespace, key)
-	if err != nil || len(versions) == 0 {
-		return "", os.ErrNotExist
+func getVersionMetadata(ns, key, version string) (*VersionMetadata, error) {
+	metaPath := filepath.Join(basePath, ns, metaFileName)
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		return nil, err
 	}
-	return filepath.Join(basePath, namespace, versions[len(versions)-1]), nil
-}
-
-func specificVersionPath(namespace, version string) (string, error) {
-	path := filepath.Join(basePath, namespace, version)
-	if _, err := os.Stat(path); err != nil {
-		return "", err
+	var metas []Metadata
+	if err := json.Unmarshal(data, &metas); err != nil {
+		return nil, err
 	}
-	return path, nil
-}
-
-func writeToReplicas(paths []string, data []byte) error {
-	var wg sync.WaitGroup
-	errChan := make(chan error, len(paths))
-	for _, path := range paths {
-		wg.Add(1)
-		go func(p string) {
-			defer wg.Done()
-			if err := os.WriteFile(p, data, 0644); err != nil {
-				errChan <- err
+	for _, m := range metas {
+		if m.Key == key {
+			if vm, ok := m.Versions[version]; ok {
+				return &vm, nil
 			}
-		}(path)
+			break
+		}
 	}
-	wg.Wait()
-	close(errChan)
-	if len(errChan) > 0 {
-		return <-errChan
+	return nil, os.ErrNotExist
+}
+
+func uploadHandler(c *fiber.Ctx) error {
+	ns := c.Params("namespace")
+	key := c.Params("key")
+	password := c.Get("X-Password", "")
+
+	data := c.Body()
+	contentType := http.DetectContentType(data)
+	ext := getExtensionFromContentType(contentType)
+	if ext == "" {
+		ext = ".bin"
 	}
-	return nil
+	versionName := fmt.Sprintf("%s_%d%s", key, time.Now().UnixNano(), ext)
+	versionPath := filepath.Join(basePath, ns, versionName)
+	_ = os.MkdirAll(filepath.Join(basePath, ns), os.ModePerm)
+	if err := os.WriteFile(versionPath, data, 0644); err != nil {
+		return err
+	}
+
+	var pwHash string
+	if password != "" {
+		pwHash = hashPassword(password)
+	}
+
+	writeMetadata(ns, key, VersionMetadata{
+		Version:      versionName,
+		Size:         len(data),
+		CreatedAt:    time.Now(),
+		ContentType:  contentType,
+		PasswordHash: pwHash,
+	})
+
+	return c.JSON(fiber.Map{
+		"message": "Uploaded successfully",
+		"key":     key,
+		"version": versionName,
+	})
+}
+
+func getHandler(c *fiber.Ctx) error {
+	ns := c.Params("namespace")
+	key := c.Params("key")
+	password := c.Get("X-Password", "")
+
+	meta, err := getLatestVersion(ns, key)
+	if err != nil {
+		return c.Status(404).SendString("Key not found")
+	}
+
+	if meta.PasswordHash != "" && hashPassword(password) != meta.PasswordHash {
+		return c.Status(403).SendString("Unauthorized: password required")
+	}
+
+	filePath := filepath.Join(basePath, ns, meta.Version)
+	c.Set("Content-Type", meta.ContentType)
+	c.Set("X-Version", meta.Version)
+	return c.SendFile(filePath)
+}
+
+func getVersionHandler(c *fiber.Ctx) error {
+	ns := c.Params("namespace")
+	version := c.Params("version")
+	key := c.Query("key")
+	password := c.Get("X-Password", "")
+
+	meta, err := getVersionMetadata(ns, key, version)
+	if err != nil {
+		return c.Status(404).SendString("Version not found")
+	}
+
+	if meta.PasswordHash != "" && hashPassword(password) != meta.PasswordHash {
+		return c.Status(403).SendString("Unauthorized: password required")
+	}
+
+	filePath := filepath.Join(basePath, ns, meta.Version)
+	c.Set("Content-Type", meta.ContentType)
+	c.Set("X-Version", meta.Version)
+	return c.SendFile(filePath)
+}
+
+func listVersionsHandler(c *fiber.Ctx) error {
+	ns := c.Params("namespace")
+	key := c.Params("key")
+
+	metaPath := filepath.Join(basePath, ns, metaFileName)
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		return c.Status(500).SendString("Error reading metadata")
+	}
+
+	var metas []Metadata
+	if err := json.Unmarshal(data, &metas); err != nil {
+		return c.Status(500).SendString("Metadata parse error")
+	}
+
+	for _, m := range metas {
+		if m.Key == key {
+			return c.JSON(m.Versions)
+		}
+	}
+	return c.Status(404).SendString("Key not found")
+}
+
+func deleteHandler(c *fiber.Ctx) error {
+	ns := c.Params("namespace")
+	key := c.Params("key")
+	password := c.Get("X-Password", "")
+
+	metaPath := filepath.Join(basePath, ns, metaFileName)
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		return c.Status(500).SendString("Metadata file error")
+	}
+
+	var metas []Metadata
+	if err := json.Unmarshal(data, &metas); err != nil {
+		return c.Status(500).SendString("Metadata parse error")
+	}
+
+	updatedMetas := []Metadata{}
+	keyFound := false
+
+	for _, m := range metas {
+		if m.Key == key {
+			var latest VersionMetadata
+			var latestTime int64
+			for _, v := range m.Versions {
+				if t := v.CreatedAt.UnixNano(); t > latestTime {
+					latestTime = t
+					latest = v
+				}
+			}
+			if latest.PasswordHash != "" && hashPassword(password) != latest.PasswordHash {
+				return c.Status(403).SendString("Unauthorized: incorrect password")
+			}
+			for _, v := range m.Versions {
+				_ = os.Remove(filepath.Join(basePath, ns, v.Version))
+			}
+			keyFound = true
+			continue
+		}
+		updatedMetas = append(updatedMetas, m)
+	}
+
+	if !keyFound {
+		return c.Status(404).SendString("Key not found")
+	}
+
+	newData, _ := json.MarshalIndent(updatedMetas, "", "  ")
+	_ = os.WriteFile(metaPath, newData, 0644)
+
+	return c.JSON(fiber.Map{
+		"message":  "Deleted key and all versions",
+		"key":      key,
+		"namespace": ns,
+	})
+}
+
+func listNamespacesHandler(c *fiber.Ctx) error {
+	entries, err := os.ReadDir(basePath)
+	if err != nil {
+		return c.Status(500).SendString("Failed to read namespaces")
+	}
+	namespaces := []string{}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			namespaces = append(namespaces, entry.Name())
+		}
+	}
+	return c.JSON(fiber.Map{
+		"namespaces": namespaces,
+	})
+}
+
+func listKeysHandler(c *fiber.Ctx) error {
+	ns := c.Params("namespace")
+	metaPath := filepath.Join(basePath, ns, metaFileName)
+	if _, err := os.Stat(metaPath); os.IsNotExist(err) {
+		return c.JSON(fiber.Map{
+			"namespace": ns,
+			"keys":      []string{},
+		})
+	}
+
+data, err := os.ReadFile(metaPath)
+	if err != nil {
+		return c.Status(500).SendString("Error reading metadata")
+	}
+
+	var metas []Metadata
+	if err := json.Unmarshal(data, &metas); err != nil {
+		return c.Status(500).SendString("Metadata parse error")
+	}
+
+	keys := make([]string, len(metas))
+	for i, m := range metas {
+		keys[i] = m.Key
+	}
+
+	return c.JSON(fiber.Map{
+		"namespace": ns,
+		"keys":      keys,
+	})
 }
 
 func main() {
 	app := fiber.New()
+	app.Use(compress.New())
 
-	app.Post("/:namespace/:key", func(c *fiber.Ctx) error {
-		start := time.Now()
-		defer requestDuration.WithLabelValues("POST /:namespace/:key").Observe(time.Since(start).Seconds())
-
-		ns := c.Params("namespace")
-		key := c.Params("key")
-		data := c.Body()
-		contentType := c.Get("Content-Type", "application/octet-stream")
-
-		compressed, err := gzipCompress(data)
-		if err != nil {
-			return c.Status(500).SendString("Compression failed")
-		}
-
-		filePath, versionedName, err := versionedFilePath(ns, key)
-		if err != nil {
-			return c.Status(500).SendString("Failed to build path")
-		}
-
-		// Replication paths
-		paths := []string{filePath}
-		for i := 1; i < replicaCount; i++ {
-			replicaPath := fmt.Sprintf("%s.replica%d", filePath, i)
-			paths = append(paths, replicaPath)
-		}
-
-		writeWAL("WRITE", ns, key, compressed)
-		err = writeToReplicas(paths, compressed)
-		if err != nil {
-			return c.Status(500).SendString("Replica write failed")
-		}
-
-		cache.Put(ns+"/"+key, compressed)
-		writeMetadata(ns, Metadata{
-			Key:         key,
-			Version:     versionedName,
-			Size:        len(data),
-			CreatedAt:   time.Now(),
-			ContentType: contentType,
-		})
-
-		return c.JSON(fiber.Map{"status": "ok", "version": versionedName})
-	})
-
-	app.Get("/:namespace/:key", func(c *fiber.Ctx) error {
-		start := time.Now()
-		defer requestDuration.WithLabelValues("GET /:namespace/:key").Observe(time.Since(start).Seconds())
-
-		ns := c.Params("namespace")
-		key := c.Params("key")
-		cacheKey := ns + "/" + key
-		if val, ok := cache.Get(cacheKey); ok {
-			data, _ := gzipDecompress(val)
-			return c.Send(data)
-		}
-		filePath, err := latestFilePath(ns, key)
-		if err != nil {
-			return c.Status(404).SendString("Not found")
-		}
-		compressed, err := os.ReadFile(filePath)
-		if err != nil {
-			return c.Status(500).SendString("Read failed")
-		}
-		cache.Put(cacheKey, compressed)
-		data, _ := gzipDecompress(compressed)
-		return c.Send(data)
-	})
-
-	app.Get("/versions/:namespace/:key", func(c *fiber.Ctx) error {
-		ns := c.Params("namespace")
-		key := c.Params("key")
-		versions, err := listVersions(ns, key)
-		if err != nil {
-			return c.Status(500).SendString("Could not list versions")
-		}
-		return c.JSON(versions)
-	})
-
-	app.Get("/version/:namespace/:version", func(c *fiber.Ctx) error {
-		ns := c.Params("namespace")
-		version := c.Params("version")
-		filePath, err := specificVersionPath(ns, version)
-		if err != nil {
-			return c.Status(404).SendString("Version not found")
-		}
-		compressed, err := os.ReadFile(filePath)
-		if err != nil {
-			return c.Status(500).SendString("Read failed")
-		}
-		data, err := gzipDecompress(compressed)
-		if err != nil {
-			return c.Status(500).SendString("Decompression failed")
-		}
-		return c.Send(data)
-	})
-
-	app.Get("/metadata/:namespace/:key", func(c *fiber.Ctx) error {
-		ns := c.Params("namespace")
-		key := c.Params("key")
-		metaPath := filepath.Join(basePath, ns, metaFileName)
-		data, err := os.ReadFile(metaPath)
-		if err != nil {
-			return c.Status(500).SendString("Metadata not found")
-		}
-		var metas []Metadata
-		_ = json.Unmarshal(data, &metas)
-		var filtered []Metadata
-		for _, m := range metas {
-			if m.Key == key {
-				filtered = append(filtered, m)
-			}
-		}
-		return c.JSON(filtered)
-	})
-
-	app.Get("/namespaces", func(c *fiber.Ctx) error {
-		entries, err := os.ReadDir(basePath)
-		if err != nil {
-			return c.Status(500).SendString("Failed to list namespaces")
-		}
-		var namespaces []string
-		for _, e := range entries {
-			if e.IsDir() {
-				namespaces = append(namespaces, e.Name())
-			}
-		}
-		return c.JSON(namespaces)
-	})
-
-	app.Get("/namespace/:name/files", func(c *fiber.Ctx) error {
-		ns := c.Params("name")
-		dir := filepath.Join(basePath, ns)
-		files, err := os.ReadDir(dir)
-		if err != nil {
-			return c.Status(500).SendString("Namespace not found")
-		}
-		var keys []string
-		for _, f := range files {
-			if strings.HasSuffix(f.Name(), ".gz") {
-				key := strings.Split(f.Name(), "_")[0]
-				keys = append(keys, key)
-			}
-		}
-		return c.JSON(keys)
-	})
+	app.Post("/:namespace/:key", uploadHandler)
+	app.Get("/:namespace/:key", getHandler)
+	app.Get("/version/:namespace/:version", getVersionHandler)
+	app.Get("/versions/:namespace/:key", listVersionsHandler)
+	app.Get("/namespace", listNamespacesHandler)
+	app.Get("/:namespace", listKeysHandler)
+	app.Delete("/:namespace/:key", deleteHandler)
 
 	port := 3000
-	fmt.Printf("✈ Running on http://localhost:%d\n", port)
+	fmt.Printf("🚀 NebulaDB running on http://localhost:%d\n", port)
 	app.Listen(":" + strconv.Itoa(port))
 }
