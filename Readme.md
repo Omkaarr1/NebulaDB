@@ -78,7 +78,7 @@ NebulaDB can be containerized and deployed in seconds without any external depen
 docker build -t nebuladb .
 
 # Run the container
-docker run -p 8080:8080 nebuladb
+docker run -p 3000:3000 nebuladb
 ```
 
 ---
@@ -86,7 +86,7 @@ docker run -p 8080:8080 nebuladb
 ## 📡 API Reference
 
 All endpoints are under:  
-`http://localhost:8080`
+`http://localhost:3000`
 
 ### **🔸 Store Data (POST)**
 
