@@ -54,15 +54,27 @@ docker run --rm -p 3000:3000 -v "$(pwd)/data:/data" \
 
 ---
 
-## 📡 API Reference (current)
+# 📡 API Reference (Complete)
 
 Base URL: `http://localhost:3000`
 
-### Store / Update (latest version)
+### Common headers & behaviors
+
+* **`Content-Type`**: auto-detected on upload; echoed on reads.
+* **`X-Password`** (optional on upload): protects the key; same header required to read or delete.
+* **`ETag`** on reads: you can send **`If-None-Match`** to get `304 Not Modified`.
+* **`X-Version`** on reads: returns the version ID you got.
+* **Version IDs**: short (base36 time + 4 random bytes), e.g. `l8g7ma1f1b2c`.
+
+---
+
+## 1) Key/Value (KV) routes
+
+### Create/Update (write a new version)
 
 **POST** `/:namespace/:key`
-Body: raw binary, JSON, or text
-Optional: `X-Password: <secret>` to protect this key (checked on reads/deletes)
+Body: raw binary / JSON / text
+Optional headers: `X-Password: <secret>`
 
 **Response**
 
@@ -76,23 +88,39 @@ Optional: `X-Password: <secret>` to protect this key (checked on reads/deletes)
 }
 ```
 
-### Get latest
+**Notes**
+
+* Writes are **atomic** (tmp → fsync → rename → dir fsync).
+* The path `ns=sql` + `key=execute` is **reserved** for the SQL API; you’ll get `405` if you try to upload there.
+
+---
+
+### Read (latest version)
 
 **GET** `/u/:namespace/:key`
+Optional headers:
 
-* Returns raw blob with `Content-Type` and `ETag` headers
-* Optional: `If-None-Match` for 304s
-* Optional: `X-Password` if key is protected
+* `X-Password: <secret>` (if protected)
+* `If-None-Match: "l8g7ma1f1b2c"` (returns `304` if unchanged)
 
-### Get a specific version
+**Response**
+
+* Body: raw blob
+* Headers: `Content-Type`, `ETag`, `X-Version`, `Last-Modified`
+
+---
+
+### Read (specific version)
 
 **GET** `/u/:namespace/:key/:version`
+Same behavior as “Read latest,” but fixed to `:version`.
 
-* Same behaviors/headers as above
+---
 
 ### List versions for a key
 
 **GET** `/versions/:namespace/:key`
+
 **Response**
 
 ```json
@@ -108,51 +136,85 @@ Optional: `X-Password: <secret>` to protect this key (checked on reads/deletes)
 ]
 ```
 
-### List namespaces
+---
+
+### List all namespaces
 
 **GET** `/namespace`
+
 **Response**
 
 ```json
 { "namespaces": ["myspace", "images", "notes"] }
 ```
 
+---
+
 ### List keys in a namespace
 
 **GET** `/:namespace`
+
 **Response**
 
 ```json
 {
   "namespace": "myspace",
   "keys": [
-    { "Key": "profile", "LatestURL": "/u/myspace/profile" }
+    { "Key": "profile", "LatestURL": "/u/myspace/profile" },
+    { "Key": "avatar",  "LatestURL": "/u/myspace/avatar" }
   ]
 }
 ```
 
+---
+
 ### Delete a key (all versions)
 
 **DELETE** `/:namespace/:key`
-
-* If the latest version was uploaded with `X-Password`, the same header is required here.
+Optional header: `X-Password: <secret>` (required if protected)
 
 **Response**
 
 ```json
-{ "status": "ok", "message": "deleted key and all versions", "namespace": "myspace", "key": "profile" }
+{
+  "status": "ok",
+  "message": "deleted key and all versions",
+  "namespace": "myspace",
+  "key": "profile"
+}
 ```
 
-### Execute SQL (SQLite)
+---
+
+## 2) SQL execution (SQLite)
+
+### Execute a single statement
 
 **POST** `/sql/execute`
-Single:
+**Request**
 
 ```json
-{ "sql": "SELECT 1 AS ok" }
+{
+  "sql": "SELECT 1 AS ok"
+}
 ```
 
-Batch (transaction):
+**Response**
+
+```json
+{
+  "ok": true,
+  "duration_ms": 1,
+  "rows": [{"ok": 1}],
+  "columns": ["ok"],
+  "count": 1
+}
+```
+
+### Execute a batch (transaction)
+
+**POST** `/sql/execute`
+**Request**
 
 ```json
 {
@@ -165,18 +227,147 @@ Batch (transaction):
 }
 ```
 
-**Response (example)**
+**Response**
 
 ```json
-{ "ok": true, "duration_ms": 2, "results": [ { "rows": [{"id":1,"txt":"hello nebula"}], "count": 1 } ] }
+{
+  "ok": true,
+  "duration_ms": 3,
+  "results": [
+    { "ok": true },                                  // CREATE
+    { "ok": true, "rows_affected": 1, "last_insert_id": 1 }, // INSERT
+    { "ok": true, "columns": ["id","txt"], "rows": [{"id":1,"txt":"hello nebula"}], "count": 1 } // SELECT
+  ]
+}
 ```
 
-### Stats (everything at a glance)
+**Options**
 
-**GET** `/stats`
-Includes runtime (Go/mem/GC), cache stats (hits/misses), keyspace counts, disk usage, ops counters, and SQLite page/cache info.
+* `"timeout_ms": 5000` to bound query time.
+* You can also use single-statement form: `{"sql":"...", "args":[...]}`.
 
 ---
+
+## 3) Stats & introspection
+
+### Everything the server is doing (runtime, cache, keyspace, disk, ops, SQLite)
+
+**GET** `/stats`
+
+**Response (shape)**
+
+```json
+{
+  "runtime": { "go_version": "...", "num_cpu": 8, "num_goroutine": 32, "uptime_sec": 123, ... },
+  "disk":    { "data_dir": "/data", "total_bytes": 0, "free_bytes": 0, "used_bytes_store": 1234567 },
+  "keyspace":{ "namespaces": 2, "keys": 5, "versions": 12 },
+  "cache":   { "len": 42, "max_item_bytes": 4194304, "adds": 200, "gets": 1000, "hits": 800, "misses": 200, "removes": 10 },
+  "ops":     { "uploads": 10, "get_latest": 300, "get_version": 50, "list_versions": 20, "list_keys": 15, "list_namespaces": 2, "deletes": 1, "sql_single": 5, "sql_batch": 2 },
+  "bytes_written_since_start": 123456,
+  "sqlite":  { "enabled": true, "db_path": "/data/_sql/nebula.db", "page_size": 4096, "page_count": 123, "freelist_count": 0, "wal_bytes": 0, "file_bytes": 8192, "statements": 7, "last_use_ms": 1700000000000 },
+  "endpoints": [
+    "POST   /sql/execute",
+    "GET    /stats",
+    "POST   /:namespace/:key",
+    "GET    /u/:namespace/:key",
+    "GET    /u/:namespace/:key/:version",
+    "GET    /versions/:namespace/:key",
+    "GET    /namespace",
+    "GET    /:namespace",
+    "DELETE /:namespace/:key",
+    "GET    /:namespace/:key (legacy)",
+    "GET    /version/:namespace/:version (legacy)"
+  ]
+}
+```
+
+---
+
+## 4) Legacy (compat) routes
+
+> These exist for older clients. Prefer the short `/u/...` routes.
+
+### Legacy read latest
+
+**GET** `/:namespace/:key`
+(Equivalent to `GET /u/:namespace/:key`)
+
+### Legacy read specific version
+
+**GET** `/version/:namespace/:version?key=<key>`
+(Equivalent to `GET /u/:namespace/:key/:version`)
+
+---
+
+## Status codes you’ll see
+
+* `200 OK` – success (reads/lists/SQL)
+* `201` not used; writes return `200` with a JSON body
+* `304 Not Modified` – when `If-None-Match` matches `ETag`
+* `400 Bad Request` – invalid JSON or bad SQL
+* `403 Forbidden` – wrong/missing `X-Password` on protected keys
+* `404 Not Found` – unknown namespace/key/version
+* `405 Method Not Allowed` – reserved paths (e.g., KV upload to `/sql/execute`)
+* `500` – unexpected server errors
+
+---
+
+## Example curl snippets
+
+**Upload JSON**
+
+```bash
+curl -X POST http://localhost:3000/myspace/profile \
+  -H "Content-Type: application/json" \
+  -d '{"name":"NebulaDB","type":"demo"}'
+```
+
+**Read latest**
+
+```bash
+curl -i http://localhost:3000/u/myspace/profile
+```
+
+**Read with cache validator**
+
+```bash
+curl -i http://localhost:3000/u/myspace/profile \
+  -H 'If-None-Match: "l8g7ma1f1b2c"'
+```
+
+**List versions**
+
+```bash
+curl http://localhost:3000/versions/myspace/profile
+```
+
+**Run SQL (single)**
+
+```bash
+curl -X POST http://localhost:3000/sql/execute \
+  -H "Content-Type: application/json" \
+  -d '{"sql":"SELECT 1 AS ok"}'
+```
+
+**Run SQL (batch in a tx)**
+
+```bash
+curl -X POST http://localhost:3000/sql/execute \
+  -H "Content-Type: application/json" \
+  -d '{"tx":true,"batch":[{"sql":"CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY, txt TEXT)"},{"sql":"INSERT INTO notes(txt) VALUES (?)","args":["hello"]},{"sql":"SELECT * FROM notes"}]}'
+```
+
+**Stats**
+
+```bash
+curl http://localhost:3000/stats
+```
+
+**Delete key**
+
+```bash
+curl -X DELETE http://localhost:3000/myspace/profile
+```
 
 ## 🧠 Internals (quick)
 
